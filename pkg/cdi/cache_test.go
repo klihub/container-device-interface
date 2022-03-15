@@ -19,23 +19,38 @@ package cdi
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	oci "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
 func TestNewCache(t *testing.T) {
 	type testCase struct {
-		name    string
-		etc     map[string]string
-		run     map[string]string
-		sources map[string]string
-		errors  map[string]struct{}
+		name      string
+		option    Option
+		etc       map[string]string
+		run       map[string]string
+		sources   map[string]string
+		errors    map[string]struct{}
+		dirErrors map[string]struct{}
 	}
 	for _, tc := range []*testCase{
 		{
 			name: "no spec dirs",
+			dirErrors: map[string]struct{}{
+				"etc": {},
+				"run": {},
+			},
+		},
+		{
+			name:   "no spec dirs",
+			option: WithCreateMissingDirs(true),
 		},
 		{
 			name: "no spec files",
@@ -150,21 +165,36 @@ devices:
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				dir   string
-				err   error
-				cache *Cache
+				dir     string
+				specDir string
+				err     error
+				opts    []Option
+				cache   *Cache
 			)
 			if tc.etc != nil || tc.run != nil {
 				dir, err = createSpecDirs(t, tc.etc, tc.run)
-				if err != nil {
-					t.Errorf("failed to create test directory: %v", err)
-					return
+			} else {
+				dir, err = mkTestDir(t, nil)
+			}
+			require.NoError(t, err)
+
+			opts = []Option{
+				WithSpecDirs(
+					filepath.Join(dir, "etc"),
+					filepath.Join(dir, "run"),
+				),
+			}
+			if tc.option != nil {
+				opts = append(opts, tc.option)
+			}
+			cache, err = NewCache(opts...)
+
+			if len(tc.dirErrors) != 0 {
+				for specDir = range tc.dirErrors {
+					specDir = filepath.Join(dir, specDir)
+					require.NotNil(t, cache.GetSpecDirErrors()[specDir])
 				}
 			}
-			cache, err = NewCache(WithSpecDirs(
-				filepath.Join(dir, "etc"),
-				filepath.Join(dir, "run")),
-			)
 
 			if len(tc.errors) == 0 {
 				require.Nil(t, err)
@@ -507,57 +537,258 @@ devices:
 			var (
 				dir   string
 				err   error
+				opts  []Option
 				cache *Cache
 			)
-			for idx, update := range tc.updates {
-				if idx == 0 {
-					dir, err = createSpecDirs(t, update.etc, update.run)
+			for _, selfRefresh := range []bool{false, true} {
+				for idx, update := range tc.updates {
+					if idx == 0 {
+						dir, err = createSpecDirs(t, update.etc, update.run)
+						if err != nil {
+							t.Errorf("failed to create test directory: %v", err)
+							return
+						}
+						opts = []Option{
+							WithSpecDirs(
+								filepath.Join(dir, "etc"),
+								filepath.Join(dir, "run"),
+							),
+							WithCreateMissingDirs(true),
+						}
+						if !selfRefresh {
+							opts = append(opts, WithSelfRefresh(false))
+						}
+						cache, err = NewCache(opts...)
+						require.NotNil(t, cache)
+					} else {
+						err = updateSpecDirs(t, dir, update.etc, update.run)
+						if err != nil {
+							t.Errorf("failed to update test directory: %v", err)
+							return
+						}
+						if selfRefresh {
+							time.Sleep(100 * time.Millisecond)
+						} else {
+							err = cache.Refresh()
+
+							if len(tc.errors[idx]) == 0 {
+								require.Nil(t, err)
+							} else {
+								require.NotNil(t, err)
+							}
+						}
+					}
+
+					devices := cache.ListDevices()
+					if len(tc.devices[idx]) == 0 {
+						require.True(t, len(devices) == 0)
+					} else {
+						require.Equal(t, tc.devices[idx], devices)
+					}
+
+					for name, prio := range tc.devprio[idx] {
+						dev := cache.GetDevice(name)
+						require.NotNil(t, dev)
+						require.Equal(t, dev.GetSpec().GetPriority(), prio)
+					}
+
+					for _, v := range cache.ListVendors() {
+						for _, spec := range cache.GetVendorSpecs(v) {
+							err := cache.GetSpecErrors(spec)
+							relSpecPath, _ := filepath.Rel(dir, spec.GetPath())
+							_, ok := tc.errors[idx][relSpecPath]
+							require.True(t, (err == nil && !ok) || (err != nil && ok))
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestFuzzSelfRefreshCache(t *testing.T) {
+	type specDirs struct {
+		etc map[string]string
+		run map[string]string
+	}
+	type testCase struct {
+		name    string
+		updates []specDirs
+	}
+
+	for _, tc := range []*testCase{
+		{
+			name: "one device in /etc, update it, then shadow it in /run",
+			updates: []specDirs{
+				{
+					etc: map[string]string{
+						"vendor1.yaml": `
+cdiVersion: "0.3.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      deviceNodes:
+      - path: "/dev/original-vendor1-dev1"
+        type: b
+        major: 10
+        minor: 1
+`,
+					},
+				},
+				{
+					etc: map[string]string{
+						"vendor1.yaml": `
+cdiVersion: "0.3.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      deviceNodes:
+      - path: "/dev/updated-vendor1-dev1"
+        type: b
+        major: 10
+        minor: 1
+`,
+					},
+				},
+				{
+					run: map[string]string{
+						"vendor1.yaml": `
+cdiVersion: "0.3.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      deviceNodes:
+      - path: "/dev/shadowed-vendor1-dev1"
+        type: b
+        major: 10
+        minor: 1
+`,
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				dir    string
+				cache  *Cache
+				err    error
+				errCh  chan error
+				stopCh chan struct{}
+
+				duration = 10 * time.Second
+				wg       = &sync.WaitGroup{}
+			)
+
+			stopCh = make(chan struct{})
+			errCh = make(chan error, 2)
+
+			// injector: run injection loop until an error or request to stop
+			injector := func() {
+				var (
+					inject = "vendor1.com/device=dev1"
+					expect = map[string]struct{}{
+						"/dev/original-vendor1-dev1": {},
+						"/dev/updated-vendor1-dev1":  {},
+						"/dev/shadowed-vendor1-dev1": {},
+					}
+					unresolved []string
+					err        error
+				)
+
+				defer func() {
+					errCh <- err
+					wg.Done()
+				}()
+
+				for {
+					ociSpec := &oci.Spec{}
+					unresolved, err = cache.InjectDevices(ociSpec, inject)
 					if err != nil {
-						t.Errorf("failed to create test directory: %v", err)
+						err = errors.Wrap(err, "device injection failed")
 						return
 					}
-					cache, err = NewCache(
-						WithSpecDirs(
-							filepath.Join(dir, "etc"),
-							filepath.Join(dir, "run"),
-						),
-					)
-				} else {
+					if unresolved != nil {
+						err = errors.Errorf("unresolved devices %s", strings.Join(unresolved, ","))
+						return
+					}
+
+					result := ociSpec.Linux.Devices[0].Path
+					if _, ok := expect[result]; !ok {
+						err = errors.Errorf("unexpected device path %s", result)
+						return
+					}
+
+					select {
+					case _ = <-stopCh:
+						return
+					default:
+					}
+				}
+			}
+
+			// Run Spec update loop until an error request to stop.
+			updater := func() {
+				var (
+					idx = 1
+					err error
+				)
+
+				defer func() {
+					errCh <- err
+					wg.Done()
+				}()
+
+				for {
+					if idx >= len(tc.updates) {
+						idx = 0
+					}
+					update := tc.updates[idx]
 					err = updateSpecDirs(t, dir, update.etc, update.run)
 					if err != nil {
-						t.Errorf("failed to update test directory: %v", err)
 						return
 					}
-				}
-				err = cache.Refresh()
+					// try to amortize major fs-hit from massive create+write+rename
+					syscall.Sync()
 
-				if len(tc.errors[idx]) == 0 {
-					require.Nil(t, err)
-				} else {
-					require.NotNil(t, err)
-				}
-				require.NotNil(t, cache)
-
-				devices := cache.ListDevices()
-				if len(tc.devices[idx]) == 0 {
-					require.True(t, len(devices) == 0)
-				} else {
-					require.Equal(t, tc.devices[idx], devices)
-				}
-
-				for name, prio := range tc.devprio[idx] {
-					dev := cache.GetDevice(name)
-					require.NotNil(t, dev)
-					require.Equal(t, dev.GetSpec().GetPriority(), prio)
-				}
-
-				for _, v := range cache.ListVendors() {
-					for _, spec := range cache.GetVendorSpecs(v) {
-						err := cache.GetSpecErrors(spec)
-						relSpecPath, _ := filepath.Rel(dir, spec.GetPath())
-						_, ok := tc.errors[idx][relSpecPath]
-						require.True(t, (err == nil && !ok) || (err != nil && ok))
+					select {
+					case _ = <-stopCh:
+						return
+					default:
 					}
+
+					idx++
+				}
+			}
+
+			dir, err = createSpecDirs(t, tc.updates[0].etc, tc.updates[0].run)
+			require.NoError(t, err)
+
+			cache, err = NewCache(
+				WithSpecDirs(
+					filepath.Join(dir, "etc"),
+					filepath.Join(dir, "run"),
+				),
+			)
+			require.NoError(t, err)
+			require.NotNil(t, cache)
+
+			go injector()
+			go updater()
+			wg.Add(2)
+
+			done := time.After(duration)
+			for {
+				select {
+				case err = <-errCh:
+					require.NotNil(t, err)
+				case _ = <-done:
+					close(stopCh)
+					wg.Wait()
+					return
 				}
 			}
 		})
@@ -1203,6 +1434,22 @@ func updateSpecDirs(t *testing.T, dir string, etc, run map[string]string) error 
 		}
 	}
 	return updateTestDir(t, dir, updates)
+}
+
+func touchFiles(dir string, files []string) error {
+	for _, file := range files {
+		path := filepath.Join(dir, file)
+		err := os.MkdirAll(filepath.Dir(path), 0o755)
+		if err != nil {
+			return errors.Wrapf(err, "failed to touch file %s", path)
+		}
+		f, err := os.Create(path)
+		if err != nil {
+			return errors.Wrap(err, "failed to touch file")
+		}
+		f.Close()
+	}
+	return nil
 }
 
 func int64ptr(v int64) *int64 {

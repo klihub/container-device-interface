@@ -53,6 +53,16 @@ func WithSpecDirs(dirs ...string) Option {
 	}
 }
 
+// WithCreateMissingDirs returns an option that causes the Cache to create
+// missing Spec directories. Failure to create a directory is treated as an
+// error.
+func WithCreateMissingDirs(create bool) Option {
+	return func(c *Cache) error {
+		c.createDirs = create
+		return nil
+	}
+}
+
 // scanSpecFunc is a function for processing CDI Spec files.
 type scanSpecFunc func(string, int, *Spec, error) error
 

@@ -67,9 +67,22 @@
 //
 // Cache Refresh
 //
-// In a runtime implementation one typically wants to make sure the
-// CDI Spec cache is up to date before performing device injection.
-// A code snippet similar to the following accmplishes that:
+// By default the CDI Spec cache monitors the configured Spec directories
+// and automatically refreshes itself when necessary. This behavior can be
+// changed using the WithSelfRefresh() option.
+//
+// When self-refresh is enabled all Spec directories are expected to exist
+// when the cache is instantiated. Failure to set up monitoring for a Spec
+// directory causes the directory to get ignored and an error to be recorded
+// among the Spec directory errors. These errors can be queried using the
+// GetSpecDirErrors() function.
+//
+// The WithCreateMissingDirs() option can be used to tell the cache to try
+// creating a missing Spec directory first instead of outright ignoring it.
+//
+// With self-refresh enabled injecting any CDI devices can be done without
+// an explicit call to Refresh(), using a code snippet similar to the
+// following:
 //
 //  import (
 //      "fmt"
@@ -85,17 +98,6 @@
 //  func injectCDIDevices(spec *oci.Spec, devices []string) error {
 //      registry := cdi.GetRegistry()
 //
-//      if err := registry.Refresh(); err != nil {
-//          // Note:
-//          //   It is up to the implementation to decide whether
-//          //   to abort injection on errors. A failed Refresh()
-//          //   does not necessarily render the registry unusable.
-//          //   For instance, a parse error in a Spec file for
-//          //   vendor A does not have any effect on devices of
-//          //   vendor B...
-//          log.Warnf("pre-injection Refresh() failed: %v", err)
-//      }
-//
 //      log.Debug("pristine OCI Spec: %s", dumpSpec(spec))
 //
 //      unresolved, err := registry.InjectDevices(spec, devices)
@@ -106,6 +108,7 @@
 //      log.Debug("CDI-updated OCI Spec: %s", dumpSpec(spec))
 //      return nil
 //  }
+//
 //
 // Generated Spec Files, Multiple Directories, Device Precedence
 //
