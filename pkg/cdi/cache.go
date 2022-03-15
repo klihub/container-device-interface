@@ -17,11 +17,13 @@
 package cdi
 
 import (
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/hashicorp/go-multierror"
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -37,26 +39,42 @@ type Cache struct {
 	specs    map[string][]*Spec
 	devices  map[string]*Device
 	errors   map[string][]error
+
+	selfRefresh bool
+	w           *fsnotify.Watcher
+	watched     map[string]bool
+	missing     map[string]bool
+}
+
+// WithoutSelfRefresh returns an option to disable automatic Cache refresh.
+// Normally, when self-refresh is enabled the list of Spec directories are
+// monitored and the Cache is automatically refreshed whenever a change is
+// detected. This option disables this behavior, requiring the cache to be
+// manually refreshed.
+func WithoutSelfRefresh() Option {
+	return func(c *Cache) error {
+		c.selfRefresh = false
+		return nil
+	}
 }
 
 // NewCache creates a new CDI Cache. The cache is populated from a set
 // of CDI Spec directories. These can be specified using a WithSpecDirs
 // option. The default set of directories is exposed in DefaultSpecDirs.
 func NewCache(options ...Option) (*Cache, error) {
-	c := &Cache{}
+	c := &Cache{selfRefresh: true}
 
-	if err := c.Configure(options...); err != nil {
+	WithSpecDirs(DefaultSpecDirs...)(c)
+	err := c.configure(options...)
+	if err != nil {
 		return nil, err
 	}
-	if len(c.specDirs) == 0 {
-		c.Configure(WithSpecDirs(DefaultSpecDirs...))
-	}
 
-	return c, c.Refresh()
+	return c, nil
 }
 
-// Configure applies options to the cache. Updates the cache if options have
-// changed.
+// Configure applies options to the Cache. Updates and refreshes the
+// Cache if options have changed.
 func (c *Cache) Configure(options ...Option) error {
 	if len(options) == 0 {
 		return nil
@@ -65,17 +83,49 @@ func (c *Cache) Configure(options ...Option) error {
 	c.Lock()
 	defer c.Unlock()
 
+	return c.configure(options...)
+}
+
+// Configure the Cache. Start/stop CDI Spec directory watch, refresh
+// the Cache if necessary.
+func (c *Cache) configure(options ...Option) error {
 	for _, o := range options {
 		if err := o(c); err != nil {
 			return errors.Wrapf(err, "failed to apply cache options")
 		}
 	}
 
-	return nil
+	return c.startWatch()
 }
 
 // Refresh rescans the CDI Spec directories and refreshes the Cache.
+// In manual refresh mode the cache is always refreshed. In self-
+// refresh mode the cache is only refreshed if it is out of date.
 func (c *Cache) Refresh() error {
+	c.Lock()
+	defer c.Unlock()
+
+	// collect cached errors globally as a single multierror
+	cachedErrors := func() error {
+		var result error
+		for _, err := range c.errors {
+			result = multierror.Append(result, err...)
+		}
+		return result
+	}
+
+	// We need to refresh if
+	// - we're in manual refresh mode, or
+	// - in self-refresh mode a missing Spec dir appears (added to watch)
+	if !c.selfRefresh || (len(c.missing) > 0 && c.updateWatch()) {
+		return c.refresh()
+	}
+
+	return cachedErrors()
+}
+
+// Rescan CDI Spec directories and refresh the Cache.
+func (c *Cache) refresh() error {
 	var (
 		specs      = map[string][]*Spec{}
 		devices    = map[string]*Device{}
@@ -135,9 +185,6 @@ func (c *Cache) Refresh() error {
 		delete(devices, conflict)
 	}
 
-	c.Lock()
-	defer c.Unlock()
-
 	c.specs = specs
 	c.devices = devices
 	c.errors = specErrors
@@ -161,6 +208,13 @@ func (c *Cache) InjectDevices(ociSpec *oci.Spec, devices ...string) ([]string, e
 
 	c.Lock()
 	defer c.Unlock()
+
+	// in self-refresh mode trigger a refresh here if a Spec dir appears
+	if c.selfRefresh && len(c.missing) > 0 {
+		if c.updateWatch() {
+			c.refresh()
+		}
+	}
 
 	edits := &ContainerEdits{}
 	specs := map[*Spec]struct{}{}
@@ -276,4 +330,110 @@ func (c *Cache) GetSpecDirectories() []string {
 	dirs := make([]string, len(c.specDirs))
 	copy(dirs, c.specDirs)
 	return dirs
+}
+
+// Start watching Spec directories for changes.
+func (c *Cache) startWatch() error {
+	var (
+		dir string
+		err error
+	)
+
+	c.stopWatch()
+
+	c.watched = make(map[string]bool)
+	c.missing = make(map[string]bool)
+
+	if c.selfRefresh {
+		c.w, err = fsnotify.NewWatcher()
+		if err != nil {
+			return errors.Wrap(err, "failed to restart Spec dir watch")
+		}
+
+		for _, dir = range c.specDirs {
+			c.missing[dir] = true
+		}
+		c.updateWatch()
+		go c.watchDirs(c.w)
+	}
+
+	c.refresh()
+	return nil
+}
+
+// Stop watching Spec directories for changes.
+func (c *Cache) stopWatch() {
+	if c.w == nil {
+		return
+	}
+	c.w.Close()
+	c.w = nil
+}
+
+// Update Spec directory watch, adding any newly created Spec dirs or
+// removing any requested/removed directories.
+func (c *Cache) updateWatch(removed ...string) bool {
+	var (
+		dir    string
+		err    error
+		update bool
+	)
+
+	for dir = range c.missing {
+		err = c.w.Add(dir)
+		switch {
+		case err == nil:
+			c.watched[dir] = true
+			delete(c.missing, dir)
+			update = true
+		case !os.IsNotExist(err):
+			fallthrough
+		default:
+			c.missing[dir] = true
+		}
+	}
+
+	for _, dir = range removed {
+		delete(c.watched, dir)
+		c.missing[dir] = true
+		update = true
+	}
+
+	return update
+}
+
+// Watch Spec directory events, triggering a refresh() for changes.
+func (c *Cache) watchDirs(w *fsnotify.Watcher) {
+	for {
+		select {
+		case e, ok := <-w.Events:
+			if !ok {
+				return
+			}
+
+			if (e.Op & (fsnotify.Rename | fsnotify.Remove | fsnotify.Write)) == 0 {
+				continue
+			}
+
+			if e.Op == fsnotify.Write {
+				if ext := filepath.Ext(e.Name); ext != ".json" && ext != ".yaml" {
+					continue
+				}
+			}
+
+			c.Lock()
+			var removed []string
+			if e.Op == fsnotify.Remove && c.watched[e.Name] {
+				removed = []string{e.Name}
+			}
+			c.updateWatch(removed...)
+			c.refresh()
+			c.Unlock()
+
+		case _, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+		}
+	}
 }
