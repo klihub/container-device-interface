@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/require"
@@ -507,56 +508,67 @@ devices:
 			var (
 				dir   string
 				err   error
+				opts  []Option
 				cache *Cache
 			)
-			for idx, update := range tc.updates {
-				if idx == 0 {
-					dir, err = createSpecDirs(t, update.etc, update.run)
-					if err != nil {
-						t.Errorf("failed to create test directory: %v", err)
-						return
+			for _, selfRefresh := range []bool{false, true} {
+				for idx, update := range tc.updates {
+					if idx == 0 {
+						dir, err = createSpecDirs(t, update.etc, update.run)
+						if err != nil {
+							t.Errorf("failed to create test directory: %v", err)
+							return
+						}
+						opts = []Option{
+							WithSpecDirs(
+								filepath.Join(dir, "etc"),
+								filepath.Join(dir, "run"),
+							),
+						}
+						if !selfRefresh {
+							opts = append(opts, WithoutSelfRefresh())
+						}
+						cache, err = NewCache(opts...)
+						require.NotNil(t, cache)
+					} else {
+						err = updateSpecDirs(t, dir, update.etc, update.run)
+						if err != nil {
+							t.Errorf("failed to update test directory: %v", err)
+							return
+						}
+						if selfRefresh {
+							time.Sleep(100 * time.Millisecond)
+						} else {
+							err = cache.Refresh()
+
+							if len(tc.errors[idx]) == 0 {
+								require.Nil(t, err)
+							} else {
+								require.NotNil(t, err)
+							}
+						}
 					}
-					cache, err = NewCache(
-						WithSpecDirs(
-							filepath.Join(dir, "etc"),
-							filepath.Join(dir, "run"),
-						),
-					)
-				} else {
-					err = updateSpecDirs(t, dir, update.etc, update.run)
-					if err != nil {
-						t.Errorf("failed to update test directory: %v", err)
-						return
+
+					devices := cache.ListDevices()
+					if len(tc.devices[idx]) == 0 {
+						require.True(t, len(devices) == 0)
+					} else {
+						require.Equal(t, tc.devices[idx], devices)
 					}
-				}
-				err = cache.Refresh()
 
-				if len(tc.errors[idx]) == 0 {
-					require.Nil(t, err)
-				} else {
-					require.NotNil(t, err)
-				}
-				require.NotNil(t, cache)
+					for name, prio := range tc.devprio[idx] {
+						dev := cache.GetDevice(name)
+						require.NotNil(t, dev)
+						require.Equal(t, dev.GetSpec().GetPriority(), prio)
+					}
 
-				devices := cache.ListDevices()
-				if len(tc.devices[idx]) == 0 {
-					require.True(t, len(devices) == 0)
-				} else {
-					require.Equal(t, tc.devices[idx], devices)
-				}
-
-				for name, prio := range tc.devprio[idx] {
-					dev := cache.GetDevice(name)
-					require.NotNil(t, dev)
-					require.Equal(t, dev.GetSpec().GetPriority(), prio)
-				}
-
-				for _, v := range cache.ListVendors() {
-					for _, spec := range cache.GetVendorSpecs(v) {
-						err := cache.GetSpecErrors(spec)
-						relSpecPath, _ := filepath.Rel(dir, spec.GetPath())
-						_, ok := tc.errors[idx][relSpecPath]
-						require.True(t, (err == nil && !ok) || (err != nil && ok))
+					for _, v := range cache.ListVendors() {
+						for _, spec := range cache.GetVendorSpecs(v) {
+							err := cache.GetSpecErrors(spec)
+							relSpecPath, _ := filepath.Rel(dir, spec.GetPath())
+							_, ok := tc.errors[idx][relSpecPath]
+							require.True(t, (err == nil && !ok) || (err != nil && ok))
+						}
 					}
 				}
 			}
