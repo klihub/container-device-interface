@@ -19,10 +19,12 @@ package cdi
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	oci "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -572,6 +574,149 @@ devices:
 					}
 				}
 			}
+		})
+	}
+}
+
+func TestFuzzSelfRefreshCache(t *testing.T) {
+	type specDirs struct {
+		etc map[string]string
+		run map[string]string
+	}
+	type testCase struct {
+		name    string
+		updates []specDirs
+	}
+
+	for _, tc := range []*testCase{
+		{
+			name: "one device in /etc, update it, then shadow it in /run",
+			updates: []specDirs{
+				{
+					etc: map[string]string{
+						"vendor1.yaml": `
+cdiVersion: "0.3.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      deviceNodes:
+      - path: "/dev/original-vendor1-dev1"
+        type: b
+        major: 10
+        minor: 1
+`,
+					},
+				},
+				{
+					etc: map[string]string{
+						"vendor1.yaml": `
+cdiVersion: "0.3.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      deviceNodes:
+      - path: "/dev/updated-vendor1-dev1"
+        type: b
+        major: 10
+        minor: 1
+`,
+					},
+				},
+				{
+					run: map[string]string{
+						"vendor1.yaml": `
+cdiVersion: "0.3.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      deviceNodes:
+      - path: "/dev/shadowed-vendor1-dev1"
+        type: b
+        major: 10
+        minor: 1
+`,
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				runCh chan string
+				errCh chan error
+			)
+
+			runCh = make(chan string)
+			errCh = make(chan error)
+			device := "vendor1.com/device=dev1"
+
+			go func() {
+				var (
+					expect = map[string]struct{}{
+						"/dev/original-vendor1-dev1": struct{}{},
+						"/dev/updated-vendor1-dev1":  struct{}{},
+						"/dev/shadowed-vendor1-dev1": struct{}{},
+					}
+				)
+
+				dir := <-runCh
+
+				cache, err := NewCache(
+					WithSpecDirs(
+						filepath.Join(dir, "etc"),
+						filepath.Join(dir, "run"),
+					),
+				)
+
+				if err != nil {
+					errCh <- errors.Wrap(err, "failed to create cache")
+					return
+				}
+
+				for i := 0; i < 100000; i++ {
+					ociSpec := &oci.Spec{}
+					unresolved, err := cache.InjectDevices(ociSpec, device)
+
+					if err != nil {
+						err = errors.Wrap(err, "device injection failed")
+						break
+					}
+					if unresolved != nil {
+						err = errors.Errorf("unresolved devices %s",
+							strings.Join(unresolved, ","))
+						break
+					}
+
+					result := ociSpec.Linux.Devices[0].Path
+					if _, ok := expect[result]; !ok {
+						err = errors.Errorf("unexpected device path %s", result)
+						break
+					}
+				}
+
+				errCh <- err
+				close(errCh)
+			}()
+
+			dir, err := createSpecDirs(t, tc.updates[0].etc, tc.updates[0].run)
+			require.NoError(t, err)
+
+			runCh <- dir
+			close(runCh)
+
+			for idx := 1; idx < 100000; idx++ {
+				update := tc.updates[idx%len(tc.updates)]
+				err = updateSpecDirs(t, dir, update.etc, update.run)
+				if err != nil {
+					require.NoError(t, err)
+				}
+				idx++
+			}
+			err = <-errCh
+			require.NoError(t, err)
 		})
 	}
 }
