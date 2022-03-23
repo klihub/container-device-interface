@@ -17,6 +17,7 @@
 package cdi
 
 import (
+	"encoding/json"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -64,7 +65,7 @@ func ReadSpec(path string, priority int) (*Spec, error) {
 		return nil, errors.Wrapf(err, "failed to read CDI Spec %q", path)
 	}
 
-	raw, err := parseSpec(data)
+	raw, err := ParseSpec(data)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse CDI Spec %q", path)
 	}
@@ -103,6 +104,44 @@ func NewSpec(raw *cdi.Spec, path string, priority int) (*Spec, error) {
 	}
 
 	return spec, nil
+}
+
+// Write the CDI Spec to the file associated with it during instantiation
+// by NewSpec() or ReadSpec().
+func (s *Spec) Write() error {
+	var (
+		data []byte
+		err  error
+		tmp  string
+	)
+
+	if filepath.Ext(s.path) == ".yaml" {
+		data, err = yaml.Marshal(s.Spec)
+	} else {
+		data, err = json.Marshal(s.Spec)
+	}
+	if err != nil {
+		return errors.Wrapf(err, "failed to marshal Spec file %s", s.path)
+	}
+
+	err = os.MkdirAll(filepath.Dir(s.path), 0o755)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create Spec file %s", s.path)
+	}
+
+	tmp = s.path + ".tmp"
+	err = ioutil.WriteFile(tmp, data, 0o755)
+	if err != nil {
+		return errors.Wrapf(err, "failed to write Spec file %s", tmp)
+	}
+
+	err = os.Rename(tmp, s.path)
+	if err != nil {
+		os.Remove(tmp)
+		return errors.Wrapf(err, "failed to rename Spec file %s", s.path)
+	}
+
+	return nil
 }
 
 // GetVendor returns the vendor of this Spec.
@@ -179,8 +218,8 @@ func validateVersion(version string) error {
 	return nil
 }
 
-// Parse raw CDI Spec file data.
-func parseSpec(data []byte) (*cdi.Spec, error) {
+// ParseSpec parses CDI Spec data into a raw CDI Spec.
+func ParseSpec(data []byte) (*cdi.Spec, error) {
 	var raw *cdi.Spec
 	err := yaml.UnmarshalStrict(data, &raw)
 	if err != nil {
