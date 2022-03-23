@@ -19,6 +19,7 @@ package cdi
 import (
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/pkg/errors"
@@ -249,6 +250,101 @@ devices:
 			}
 			require.NoError(t, err)
 			require.NotNil(t, spec)
+		})
+	}
+}
+
+func TestWriteSpec(t *testing.T) {
+	type testCase struct {
+		name string
+		data string
+	}
+	for _, tc := range []*testCase{
+		{
+			name: "spec1",
+			data: `
+cdiVersion: "0.3.0"
+kind: vendor.com/device
+devices:
+  - name: "dev1"
+    containerEdits:
+      env:
+        - "FOO=BAR"
+  - name: "dev2"
+    containerEdits:
+      env:
+        - "BAR=FOO"
+  - name: "dev3"
+    containerEdits:
+      env:
+        - "SPACE=BAR"
+`,
+		},
+		{
+			name: "spec2",
+			data: `
+cdiVersion: "0.3.0"
+kind: vendor.com/device
+devices:
+  - name: "dev4"
+    containerEdits:
+      env:
+        - "BAR=FOO"
+  - name: "dev5"
+    containerEdits:
+      env:
+        - "XYZ=ZY"
+  - name: "dev6"
+    containerEdits:
+      env:
+        - "BAR=SPACE"
+`,
+		},
+		{
+			name: "spec3",
+			data: `
+cdiVersion: "0.3.0"
+kind: vendor.com/device
+devices:
+  - name: "dev7"
+    containerEdits:
+      env:
+        - "FOO=BAR"
+  - name: "dev8"
+    containerEdits:
+      env:
+        - "FOOBAR=BARFOO"
+  - name: "dev9"
+    containerEdits:
+      env:
+        - "SPACE=BAR"
+`,
+		},
+	} {
+		dir, err := mkTestDir(t, nil)
+		require.NoError(t, err)
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				raw  *cdi.Spec
+				spec *Spec
+				chk  *Spec
+				err  error
+			)
+
+			raw, err = parseSpec([]byte(tc.data))
+			require.NoError(t, err)
+
+			spec, err = NewSpec(raw, filepath.Join(dir, tc.name), 0)
+			require.NoError(t, err)
+			require.NotNil(t, spec)
+
+			err = spec.Write()
+			require.NoError(t, err)
+
+			chk, err = ReadSpec(spec.GetPath(), spec.GetPriority())
+			require.NoError(t, err)
+			require.NotNil(t, chk)
+			require.Equal(t, spec.Spec, chk.Spec)
 		})
 	}
 }
