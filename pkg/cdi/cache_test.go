@@ -17,9 +17,11 @@
 package cdi
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -645,26 +647,31 @@ devices:
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
-				runCh chan string
+				endCh chan struct{}
 				errCh chan error
 			)
 
-			runCh = make(chan string)
-			errCh = make(chan error)
-			device := "vendor1.com/device=dev1"
+			endCh = make(chan struct{})
+			errCh = make(chan error, 2)
 
-			go func() {
+			injector := func(dir string, wg *sync.WaitGroup) {
 				var (
+					device = "vendor1.com/device=dev1"
 					expect = map[string]struct{}{
 						"/dev/original-vendor1-dev1": struct{}{},
 						"/dev/updated-vendor1-dev1":  struct{}{},
 						"/dev/shadowed-vendor1-dev1": struct{}{},
 					}
+					cache *Cache
+					err   error
 				)
 
-				dir := <-runCh
+				defer func() {
+					errCh <- err
+					wg.Done()
+				}()
 
-				cache, err := NewCache(
+				cache, err = NewCache(
 					WithSpecDirs(
 						filepath.Join(dir, "etc"),
 						filepath.Join(dir, "run"),
@@ -672,51 +679,91 @@ devices:
 				)
 
 				if err != nil {
-					errCh <- errors.Wrap(err, "failed to create cache")
+					err = errors.Wrap(err, "failed to create cache")
 					return
 				}
 
-				for i := 0; i < 100000; i++ {
+				for {
 					ociSpec := &oci.Spec{}
 					unresolved, err := cache.InjectDevices(ociSpec, device)
 
 					if err != nil {
 						err = errors.Wrap(err, "device injection failed")
-						break
+						return
 					}
 					if unresolved != nil {
 						err = errors.Errorf("unresolved devices %s",
 							strings.Join(unresolved, ","))
-						break
+						return
 					}
 
 					result := ociSpec.Linux.Devices[0].Path
 					if _, ok := expect[result]; !ok {
 						err = errors.Errorf("unexpected device path %s", result)
-						break
+						return
+					}
+
+					select {
+					case _ = <-endCh:
+						return
+					default:
 					}
 				}
+			}
 
-				errCh <- err
-				close(errCh)
-			}()
+			updater := func(dir string, wg *sync.WaitGroup) {
+				var (
+					err error
+				)
+
+				defer func() {
+					errCh <- err
+					wg.Done()
+				}()
+
+				idx := 1
+				for {
+					update := tc.updates[idx]
+					err = updateSpecDirs(t, dir, update.etc, update.run)
+					if err != nil {
+						return
+					}
+
+					select {
+					case _ = <-endCh:
+						return
+					default:
+					}
+
+					idx++
+					if idx >= len(tc.updates) {
+						idx = 0
+					}
+				}
+			}
 
 			dir, err := createSpecDirs(t, tc.updates[0].etc, tc.updates[0].run)
 			require.NoError(t, err)
 
-			runCh <- dir
-			close(runCh)
+			wg := &sync.WaitGroup{}
+			wg.Add(2)
+			go updater(dir, wg)
+			go injector(dir, wg)
 
-			for idx := 1; idx < 100000; idx++ {
-				update := tc.updates[idx%len(tc.updates)]
-				err = updateSpecDirs(t, dir, update.etc, update.run)
-				if err != nil {
-					require.NoError(t, err)
+			timeout := time.After(5 * time.Second)
+			cnt := 0
+			for {
+				fmt.Printf("main round #%d...\n", cnt)
+				cnt++
+				select {
+				case err, _ := <-errCh:
+					require.NotNil(t, err)
+				case _ = <-timeout:
+					close(endCh)
+					wg.Wait()
+					return
 				}
-				idx++
 			}
-			err = <-errCh
-			require.NoError(t, err)
 		})
 	}
 }
