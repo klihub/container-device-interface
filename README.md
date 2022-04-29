@@ -20,6 +20,22 @@ However, as devices and software grows more complex, vendors want to perform mor
 In the absence of a standard for third party devices, vendors often have to write and maintain multiple plugins for different runtimes or even directly contribute vendor specific code in the runtime.
 Additionally runtimes don't uniformly expose a plugin system (or even expose a plugin system at all) leading to duplication of the functionality in higher level abstractions (such as Kubernetes device plugins).
 
+## How to configure CDI?
+
+### CRI-O configuration
+
+### Containerd configuration
+
+To enable and configure CDI support in the [containerd runtime](https://github.com/containerd/containerd) 2 configuration options `enable_cdi` and `cdi_spec_dirs` should be set in the `plugins."io.containerd.grpc.v1.cri` section of the containerd configuration file (`/etc/containerd/config.toml` by default):
+
+```
+[plugins."io.containerd.grpc.v1.cri"]
+  enable_cdi = true
+  cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+```
+
+Remember to restart containerd for any configuration changes to take effect.
+
 ## Examples
 ```bash
 $ mkdir /etc/cdi
