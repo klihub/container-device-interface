@@ -262,3 +262,12 @@ func validateSpec(raw *cdi.Spec) error {
 	}
 	return nil
 }
+
+// GetSpecFileBase returns a Spec file basename.
+func GetSpecFileBase(vendor, class, tag string) string {
+	if tag != "" {
+		return vendor + "-" + class + "-" + tag
+	}
+	return vendor + "-" + class
+
+}

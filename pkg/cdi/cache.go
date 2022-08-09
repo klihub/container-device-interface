@@ -17,16 +17,29 @@
 package cdi
 
 import (
+	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+
+	stderr "errors"
 
 	cdi "github.com/container-orchestrated-devices/container-device-interface/specs-go"
 	"github.com/fsnotify/fsnotify"
 	"github.com/hashicorp/go-multierror"
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+)
+
+const (
+	// reservationDir is the subdirectory for transient Spec reservations.
+	reservationDir = ".transient"
+	// transientPrefix is the base prefix used to transient Spec files.
+	transientPrefix = "transient."
+	// transientExt is the type/extension for transient Spec files.
+	transientExt = ".json"
 )
 
 // Option is an option to change some aspect of default CDI behavior.
@@ -255,6 +268,19 @@ func (c *Cache) InjectDevices(ociSpec *oci.Spec, devices ...string) ([]string, e
 	return nil, nil
 }
 
+// highestPrioritySpecDir returns the Spec directory with highest priority
+// and its priority.
+func (c *Cache) highestPrioritySpecDir() (string, int) {
+	if len(c.specDirs) == 0 {
+		return "", -1
+	}
+
+	prio := len(c.specDirs) - 1
+	dir := c.specDirs[prio]
+
+	return dir, prio
+}
+
 // WriteSpec writes a Spec file with the given content into the highest
 // priority Spec directory. If name has a "json" or "yaml" extension it
 // choses the encoding. Otherwise JSON encoding is used with a "json"
@@ -268,12 +294,11 @@ func (c *Cache) WriteSpec(raw *cdi.Spec, name string) error {
 		err     error
 	)
 
-	if len(c.specDirs) == 0 {
+	specDir, prio = c.highestPrioritySpecDir()
+	if specDir == "" {
 		return errors.New("no Spec directories to write to")
 	}
 
-	prio = len(c.specDirs) - 1
-	specDir = c.specDirs[prio]
 	path = filepath.Join(specDir, name)
 	if ext := filepath.Ext(path); ext != ".json" && ext != ".yaml" {
 		path += ".json"
@@ -285,6 +310,142 @@ func (c *Cache) WriteSpec(raw *cdi.Spec, name string) error {
 	}
 
 	return spec.Write(true)
+}
+
+// CreateTransientSpec creates a transient Spec file with the given content.
+// The file is put in the highest priority Spec directory. The Spec content
+// is validated before anything is written to the file system. The generated
+// file name is guaranteed to be unique among all transient Specs. The file
+// is always written as JSON. The path to the generated file is returned on
+// success. Otherwise an error is returned together with an empty path.
+//
+// If a non-empty optional tag is given, it is made a distinctive part of
+// the generated file name. This can be used to help identify Spec sources
+// in cases where multiple clients generate transient Specs with identical
+// vendor and class, simply by using a unique tag per client.
+//
+// A transient Spec is one whose lifecycle is tied to that of an external
+// entity or to events external to CDI and CDI clients, for instance the
+// creation and removal of a particular container. Generated transient Spec
+// files should eventually be removed using RemoveTransientSpec().
+func (c *Cache) CreateTransientSpec(raw *cdi.Spec, tag string, saveNameFn func(string) error) (path string, err error) {
+	var (
+		vendor string
+		class  string
+		spec   *Spec
+	)
+
+	specDir, prio := c.highestPrioritySpecDir()
+	if specDir == "" {
+		return "", errors.New("no Spec directories")
+	}
+
+	vendor, class = ParseQualifier(raw.Kind)
+	if vendor == "" {
+		return "", errors.Errorf("invalid vendor/class %q", raw.Kind)
+	}
+
+	//
+	// Notes:
+	//   For generated transient Spec files, we want both guaranteed
+	//   uniqueness for the file name and 'atomic write/creation' of
+	//   the file content. We rely on a create/write/rename sequence
+	//   for atomic creation in Spec.Write(). We use os.CreateTemp()
+	//   there to guarantee uniqueness of *the temporary file name*.
+	//
+	//   Renaming the file breaks the guarantee of uniqueness which
+	//   is not a problem there but would be a problem for transient
+	//   Specs. Therefore for transient Specs we use os.CreateTemp()
+	//   to generate 'reservation files' in a dedicated subdirectory
+	//   for transient Specs files, then use the generated name to
+	//   derive the name for the real Spec file. This is implemented
+	//   by reserveTransientSpec() with the releaseTransientSpec()
+	//   counterpart taking care of deleting any reservation files.
+	//
+	//   If a non-nil saveNameFn() is given, it is called with the
+	//   generated transient filename before the transient file gets
+	//   written to secondary storage. This should allow clients to
+	//   avoid generating multiple files accidentally, when a client
+	//   crashes right after CreateTransientSpec() returns, then
+	//   gets restarted and retries handling the same request. If a
+	//   client then finds an already saved filename when it starts
+	//   handling a request, it can either go ahead and use that
+	//   file if it knows the generated CDI device references/names,
+	//   or otherwise it can RemoveTransientSpec() then create a new
+	//   one.
+
+	path, err = reserveTransientSpec(specDir, vendor, class, tag)
+	if err != nil {
+		return "", err
+	}
+	genPath := path
+
+	defer func() {
+		if err != nil {
+			releaseTransientSpec(genPath)
+		}
+	}()
+
+	if saveNameFn != nil {
+		if err = saveNameFn(path); err != nil {
+			return "", err
+		}
+	}
+
+	spec, err = NewSpec(raw, path, prio)
+	if err != nil {
+		return "", err
+	}
+
+	err = spec.Write(true)
+	if err != nil {
+		return "", err
+	}
+
+	return path, nil
+}
+
+// RemoveTransientSpec removes the given transient Spec file.
+func (c *Cache) RemoveTransientSpec(path string) error {
+	err := os.Remove(path)
+	if err != nil && !stderr.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	return releaseTransientSpec(path)
+}
+
+// reserveTransientSpec generates a unique transient Spec file path.
+func reserveTransientSpec(dir, vendor, class, tag string) (string, error) {
+	name := GetSpecFileBase(vendor, class, tag)
+	rdir := filepath.Join(dir, reservationDir)
+
+	err := os.MkdirAll(rdir, 0o755)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to generate transient Spec")
+	}
+
+	f, err := os.CreateTemp(rdir, name+"-*")
+	if err != nil {
+		return "", errors.Wrap(err, "failed to generate transient Spec")
+	}
+
+	f.Close()
+	return filepath.Join(dir, transientPrefix+filepath.Base(f.Name())) + transientExt, nil
+}
+
+// releaseTransientSpec removes the reservation for a transient Spec file.
+func releaseTransientSpec(path string) error {
+	rdir := filepath.Dir(path)
+	name := strings.TrimSuffix(filepath.Base(path), transientExt)
+	file := strings.TrimPrefix(name, transientPrefix)
+
+	err := os.Remove(filepath.Join(rdir, reservationDir, file))
+	if err != nil && stderr.Is(err, fs.ErrNotExist) {
+		err = nil
+	}
+
+	return err
 }
 
 // GetDevice returns the cached device for the given qualified name.

@@ -107,6 +107,8 @@ type RegistrySpecDB interface {
 	GetVendorSpecs(vendor string) []*Spec
 	GetSpecErrors(*Spec) []error
 	WriteSpec(raw *cdi.Spec, name string) error
+	CreateTransientSpec(raw *cdi.Spec, tag string, saveNameFn func(string) error) (string, error)
+	RemoveTransientSpec(path string) error
 }
 
 type registry struct {
