@@ -203,7 +203,7 @@ func (s *Spec) ApplyEdits(ociSpec *oci.Spec) error {
 
 // edits returns the applicable global container edits for this spec.
 func (s *Spec) edits() *ContainerEdits {
-	return &ContainerEdits{&s.ContainerEdits}
+	return &ContainerEdits{ContainerEdits: &s.ContainerEdits}
 }
 
 // MinimumRequiredVersion determines the minimum spec version for the input spec.

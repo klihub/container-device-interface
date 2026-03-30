@@ -17,6 +17,7 @@
 package cdi
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -26,6 +27,7 @@ import (
 
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	ocigen "github.com/opencontainers/runtime-tools/generate"
+	"sigs.k8s.io/yaml"
 	cdi "tags.cncf.io/container-device-interface/specs-go"
 )
 
@@ -68,6 +70,7 @@ var (
 // is injected.
 type ContainerEdits struct {
 	*cdi.ContainerEdits
+	annotations []cdi.ContainerAnnotations
 }
 
 // Apply edits to the given OCI Spec. Updates the OCI Spec in place.
@@ -180,6 +183,12 @@ func (e *ContainerEdits) Apply(spec *oci.Spec) error {
 		specgen.AddProcessAdditionalGid(additionalGID)
 	}
 
+	for _, annotations := range e.annotations {
+		if err := (&ContainerAnnotations{annotations}).apply(spec); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -198,6 +207,13 @@ func ensureLinuxNetDevices(spec *oci.Spec) {
 	}
 	if spec.Linux.NetDevices == nil {
 		spec.Linux.NetDevices = map[string]oci.LinuxNetDevice{}
+	}
+}
+
+// Ensure OCI Spec annotations map is not nil.
+func ensureAnnotations(spec *oci.Spec) {
+	if spec.Annotations == nil {
+		spec.Annotations = map[string]string{}
 	}
 }
 
@@ -233,6 +249,9 @@ func (e *ContainerEdits) Validate() error {
 	if err := ValidateNetDevices(e.NetDevices); err != nil {
 		return err
 	}
+	if err := (&ContainerAnnotations{e.ContainerEdits.Annotations}).Validate(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -259,6 +278,13 @@ func (e *ContainerEdits) Append(o *ContainerEdits) *ContainerEdits {
 		e.IntelRdt = o.IntelRdt
 	}
 	e.AdditionalGIDs = append(e.AdditionalGIDs, o.AdditionalGIDs...)
+
+	if len(e.Annotations) > 0 && len(e.annotations) == 0 {
+		e.annotations = append(e.annotations, e.Annotations)
+	}
+	if len(o.Annotations) > 0 {
+		e.annotations = append(e.annotations, o.Annotations)
+	}
 
 	return e
 }
@@ -288,6 +314,9 @@ func (e *ContainerEdits) isEmpty() bool {
 		return false
 	}
 	if len(e.NetDevices) > 0 {
+		return false
+	}
+	if len(e.Annotations) > 0 {
 		return false
 	}
 	return true
@@ -435,6 +464,136 @@ func (i *IntelRdt) Validate() error {
 		return errors.New("invalid ClosID")
 	}
 	return nil
+}
+
+// ValidateContainerAnnotationKey validates a container annotation key.
+func ValidateContainerAnnotationKey(k string) error {
+	if prefix, _, ok := strings.Cut(k, "/"); ok && prefix+"/" != AnnotationPrefix {
+		return fmt.Errorf("prefix %q should be %q", prefix, AnnotationPrefix)
+	}
+	return nil
+}
+
+// ContainerAnnotations is a CDI ContainerAnnotations wrapper, used for validating
+// and applying container annotations.
+type ContainerAnnotations struct {
+	cdi.ContainerAnnotations
+}
+
+// Validate validates the container annotations.
+func (a ContainerAnnotations) Validate() error {
+	if len(a.ContainerAnnotations) == 0 {
+		return nil
+	}
+
+	for k, v := range a.ContainerAnnotations {
+		if err := ValidateContainerAnnotationKey(k); err != nil {
+			return fmt.Errorf("invalid annotation key %q: %w", k, err)
+		}
+		if err := (&ContainerAnnotationValue{v}).Validate(); err != nil {
+			return fmt.Errorf("invalid annotation %q: %w", k, err)
+		}
+	}
+
+	return nil
+}
+
+func (a *ContainerAnnotations) apply(spec *oci.Spec) error {
+	if len(a.ContainerAnnotations) == 0 {
+		return nil
+	}
+
+	ensureAnnotations(spec)
+
+	for k, v := range a.ContainerAnnotations {
+		if !strings.HasPrefix(k, AnnotationPrefix) {
+			k = AnnotationPrefix + k
+		}
+
+		old, ok := spec.Annotations[k]
+		if !ok {
+			spec.Annotations[k] = v.Value
+			continue
+		}
+
+		value, err := UpdateContainerAnnotationValue(old, v.Value, v.OnConflict)
+		if err != nil {
+			return fmt.Errorf("failed to update annotation %q: %w", k, err)
+		}
+
+		spec.Annotations[k] = value
+	}
+
+	return nil
+}
+
+// ContainerAnnotationValue is a CDI ContainerAnnotationValue wrapper, used for
+// validating and updating container annotation values.
+type ContainerAnnotationValue struct {
+	*cdi.ContainerAnnotationValue
+}
+
+// Validate validates a container annotation value.
+func (v *ContainerAnnotationValue) Validate() error {
+	if v == nil {
+		return errors.New("no annotation value")
+	}
+
+	switch v.Format {
+	case cdi.FormatImpliedString, cdi.FormatString, cdi.FormatStringSlice:
+	default:
+		return fmt.Errorf("invalid annotation value format %q", v.Format)
+	}
+
+	switch v.OnConflict {
+	case cdi.ConflictImpliedError, cdi.ConflictError, cdi.ConflictPickNew, cdi.ConflictPickOld:
+	case cdi.ConflictAppend:
+		if v.Format != cdi.FormatStringSlice {
+			return fmt.Errorf("%q given for non-slice format %q", v.OnConflict, v.Format)
+		}
+	}
+
+	if v.Format != cdi.FormatStringSlice {
+		return nil
+	}
+
+	slice := []string{}
+	err := yaml.UnmarshalStrict([]byte(v.Value), &slice)
+	if err != nil {
+		return fmt.Errorf("invalid %q annotation value %q: %w", v.Format, v.Value, err)
+	}
+
+	return nil
+}
+
+// UpdateContainerAnnotationValue updates an annotation value according to the given
+// conflict resolution strategy.
+func UpdateContainerAnnotationValue(old, new string, how cdi.ConflictResolution) (string, error) {
+	switch how {
+	case cdi.ConflictImpliedError, cdi.ConflictError:
+		return "", fmt.Errorf("conflicting values %q and %q", old, new)
+	case cdi.ConflictPickNew:
+		return new, nil
+	case cdi.ConflictPickOld:
+		return old, nil
+	case cdi.ConflictAppend:
+		slice := []string{}
+		if err := yaml.UnmarshalStrict([]byte(old), &slice); err != nil {
+			return "", fmt.Errorf("failed to append to annotation value %q: %w", old, err)
+		}
+		newSlice := []string{}
+		if err := yaml.UnmarshalStrict([]byte(new), &newSlice); err != nil {
+			return "", fmt.Errorf("failed to append annotation value %q: %w", new, err)
+		}
+		slice = append(slice, newSlice...)
+		raw, err := json.Marshal(slice)
+		if err != nil {
+			return "", fmt.Errorf("failed to append annotation value: %w", err)
+		}
+		return string(raw), nil
+	}
+
+	return "", fmt.Errorf("invalid conflict resolution %q", how)
 }
 
 // Ensure OCI Spec hooks are not nil so we can add hooks.

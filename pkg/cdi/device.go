@@ -62,7 +62,7 @@ func (d *Device) ApplyEdits(ociSpec *oci.Spec) error {
 
 // edits returns the applicable container edits for this spec.
 func (d *Device) edits() *ContainerEdits {
-	return &ContainerEdits{&d.ContainerEdits}
+	return &ContainerEdits{ContainerEdits: &d.ContainerEdits}
 }
 
 // Validate the device.

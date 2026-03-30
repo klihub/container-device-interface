@@ -246,9 +246,10 @@ func (c *Cache) InjectDevices(ociSpec *oci.Spec, devices ...string) ([]string, e
 			unresolved = append(unresolved, device)
 			continue
 		}
-		if _, ok := specs[d.GetSpec()]; !ok {
-			specs[d.GetSpec()] = struct{}{}
-			edits.Append(d.GetSpec().edits())
+		spec := d.GetSpec()
+		if _, ok := specs[spec]; !ok {
+			specs[spec] = struct{}{}
+			edits.Append(spec.edits())
 		}
 		edits.Append(d.edits())
 	}

@@ -22,11 +22,12 @@ import (
 	"strings"
 
 	"tags.cncf.io/container-device-interface/pkg/parser"
+	"tags.cncf.io/container-device-interface/specs-go"
 )
 
 const (
 	// AnnotationPrefix is the prefix for CDI container annotation keys.
-	AnnotationPrefix = "cdi.k8s.io/"
+	AnnotationPrefix = specs.AnnotationPrefix
 )
 
 // UpdateAnnotations updates annotations with a plugin-specific CDI device

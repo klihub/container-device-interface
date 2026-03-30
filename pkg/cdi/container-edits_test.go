@@ -348,7 +348,7 @@ func TestValidateContainerEdits(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			edits := ContainerEdits{tc.edits}
+			edits := ContainerEdits{tc.edits, nil}
 			err := edits.Validate()
 			if tc.invalid {
 				require.Error(t, err)
@@ -988,7 +988,7 @@ func TestApplyContainerEdits(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			edits := ContainerEdits{tc.edits}
+			edits := ContainerEdits{tc.edits, nil}
 			err := edits.Validate()
 			require.NoError(t, err)
 			err = edits.Apply(tc.spec)
