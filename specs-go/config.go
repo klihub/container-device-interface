@@ -24,13 +24,14 @@ type Device struct {
 
 // ContainerEdits are edits a container runtime must make to the OCI spec to expose the device.
 type ContainerEdits struct {
-	Env            []string          `json:"env,omitempty"            yaml:"env,omitempty"`
-	DeviceNodes    []*DeviceNode     `json:"deviceNodes,omitempty"    yaml:"deviceNodes,omitempty"`
-	NetDevices     []*LinuxNetDevice `json:"netDevices,omitempty"     yaml:"netDevices,omitempty"` // Added in v1.1.0
-	Hooks          []*Hook           `json:"hooks,omitempty"          yaml:"hooks,omitempty"`
-	Mounts         []*Mount          `json:"mounts,omitempty"         yaml:"mounts,omitempty"`
-	IntelRdt       *IntelRdt         `json:"intelRdt,omitempty"       yaml:"intelRdt,omitempty"`       // Added in v0.7.0
-	AdditionalGIDs []uint32          `json:"additionalGids,omitempty" yaml:"additionalGids,omitempty"` // Added in v0.7.0
+	Env            []string             `json:"env,omitempty"            yaml:"env,omitempty"`
+	DeviceNodes    []*DeviceNode        `json:"deviceNodes,omitempty"    yaml:"deviceNodes,omitempty"`
+	NetDevices     []*LinuxNetDevice    `json:"netDevices,omitempty"     yaml:"netDevices,omitempty"` // Added in v1.1.0
+	Hooks          []*Hook              `json:"hooks,omitempty"          yaml:"hooks,omitempty"`
+	Mounts         []*Mount             `json:"mounts,omitempty"         yaml:"mounts,omitempty"`
+	IntelRdt       *IntelRdt            `json:"intelRdt,omitempty"       yaml:"intelRdt,omitempty"`       // Added in v0.7.0
+	AdditionalGIDs []uint32             `json:"additionalGids,omitempty" yaml:"additionalGids,omitempty"` // Added in v0.7.0
+	Annotations    ContainerAnnotations `json:"annotations,omitempty"     yaml:"annotations,omitempty"`   // Added in v1.2.0
 }
 
 // DeviceNode represents a device node that needs to be added to the OCI spec.
@@ -77,3 +78,52 @@ type LinuxNetDevice struct {
 	HostInterfaceName string `json:"hostInterfaceName" yaml:"hostInterfaceName"`
 	Name              string `json:"name"   yaml:"name"`
 }
+
+// AnnotationPrefix is the prefix for CDI container annotation keys.
+const AnnotationPrefix = "cdi.k8s.io/"
+
+// ContainerAnnotations represents one or more annotations to be injected into the OCI Spec of
+// a container. Evenry injected annotation key will be prefixed with "cdi.k8s.io/".
+type ContainerAnnotations map[string]*ContainerAnnotationValue
+
+// ContainerAnnotationValue represents an annotation value.
+type ContainerAnnotationValue struct {
+	Value      string             `json:"value" yaml:"value"`
+	Format     ValueFormat        `json:"format,omitempty" yaml:"format,omitempty"`
+	OnConflict ConflictResolution `json:"onConflict,omitempty" yaml:"onConflict,omitempty"`
+}
+
+// ValueFormat describes how annotation values should be interpreted for conflict resolution.
+// If CDI device injection should inject a container annotation and the annotation key already
+// has a value, Format/ValueFormat and OnConflict/ConflictResolution collectively describe how
+// to resolve the conflict. ConflictError, ConflictOverwrite and ConflictKeepOld fail device
+// injection, overwrite the old value, or keep the old value respectively. ConflictAppend for
+// stringSlice Format appends the new value to the old value by demarshalling, appending and
+// marshalling the new value again.
+type ValueFormat string
+
+const (
+	// FormatImpliedString is the default/implied string annotation value format.
+	FormatImpliedString ValueFormat = ""
+	// FormatString is indicates a string annotation value format.
+	FormatString ValueFormat = "string"
+	// FormatStringSlice indicates a string slice annotation value format
+	FormatStringSlice ValueFormat = "stringSlice"
+)
+
+// ConflictResolution describes how container annotation conflicts should be resolved.
+type ConflictResolution string
+
+const (
+	// ConflictImpliedError is the default/implied 'error on conflict' resolution strategy.
+	ConflictImpliedError ConflictResolution = ""
+	// ConflictError indicates an 'error on conflict' resolution strategy.
+	ConflictError ConflictResolution = "error"
+	// ConflictPickNew indicates a 'pick new value' resolution strategy.
+	ConflictPickNew ConflictResolution = "pickNew"
+	// ConflictPickOld indicates a 'pick old value' resolution strategy.
+	ConflictPickOld ConflictResolution = "pickOld"
+	// ConflictAppend indicates a 'append new value to old value' resolution strategy.
+	// This is only valid for values of stringSlice format.
+	ConflictAppend ConflictResolution = "append" // (string slice) value is appended
+)

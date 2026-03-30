@@ -41,6 +41,7 @@ const (
 	v080 version = "v0.8.0"
 	v100 version = "v1.0.0"
 	v110 version = "v1.1.0"
+	v120 version = "v1.2.0"
 
 	// vEarliest is the earliest supported version of the CDI specification
 	vEarliest version = v030
@@ -60,6 +61,7 @@ var validSpecVersions = requiredVersionMap{
 	v080: requiresV080,
 	v100: requiresV100,
 	v110: requiresV110,
+	v120: requiresV120,
 }
 
 // ValidateVersion checks whether the specified spec version is valid.
@@ -140,6 +142,21 @@ func (r requiredVersionMap) requiredVersion(spec *Spec) version {
 	}
 
 	return minVersion
+}
+
+// requiresV120 returns true if the spec uses v1.2.0 features.
+func requiresV120(spec *Spec) bool {
+	if len(spec.ContainerEdits.Annotations) > 0 {
+		return true
+	}
+
+	for _, dev := range spec.Devices {
+		if len(dev.ContainerEdits.Annotations) > 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // requiresV110 returns true if the spec uses v1.1.0 features.
