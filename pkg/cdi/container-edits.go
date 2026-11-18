@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"tags.cncf.io/container-device-interface/internal/ociedit"
@@ -146,10 +147,10 @@ func (e *ContainerEdits) Apply(spec *oci.Spec) error {
 
 			editor.RemoveMount(m.ContainerPath)
 
-			if !specHasIDMappingNamespace(spec) {
-				editor.AddMount(mnt.toOCI())
-			} else {
+			if specHasIDMappingNamespace(spec) && idMapMountsAvailable() {
 				editor.AddMount(mnt.toOCI(withIDMapForBindMount()))
+			} else {
+				editor.AddMount(mnt.toOCI())
 			}
 		}
 		sortMounts(editor)
@@ -563,6 +564,12 @@ func (m orderedMounts) Swap(i, j int) {
 func (m orderedMounts) parts(i int) int {
 	return strings.Count(filepath.Clean(m[i].Destination), string(os.PathSeparator))
 }
+
+// idMapMountsAvailable returns true if idmapped mounts can be set up in this
+// environment. The result is cached, since it can't change during the lifetime
+// of the process. It is a function variable to allow faking host detection in
+// unit tests.
+var idMapMountsAvailable = sync.OnceValue(canIDMapMounts)
 
 // specHasIDMappingNamespace returns true if the OCI Spec has a Linux UserNamespace
 // together with both UID and GID mappings. A user namespace lacking either

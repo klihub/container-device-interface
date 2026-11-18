@@ -538,10 +538,13 @@ func TestApplyContainerEdits(t *testing.T) {
 	}
 
 	type testCase struct {
-		name   string
-		spec   *oci.Spec
-		edits  *cdi.ContainerEdits
-		result *oci.Spec
+		name string
+		spec *oci.Spec
+		// canIDMapMounts fakes whether the host is able to set up idmapped
+		// mounts for the duration of the test case.
+		canIDMapMounts bool
+		edits          *cdi.ContainerEdits
+		result         *oci.Spec
 	}
 	for _, tc := range []*testCase{
 		{
@@ -1169,7 +1172,8 @@ func TestApplyContainerEdits(t *testing.T) {
 			},
 		},
 		{
-			name: "mount added to container with Linux user namespace and uid/gid mappings",
+			name:           "mount added to container with Linux user namespace and uid/gid mappings",
+			canIDMapMounts: true,
 			spec: &oci.Spec{
 				Linux: &oci.Linux{
 					UIDMappings: []oci.LinuxIDMapping{
@@ -1267,7 +1271,8 @@ func TestApplyContainerEdits(t *testing.T) {
 			},
 		},
 		{
-			name: "mount added to container with Linux user namespace and only uid mappings",
+			name:           "mount added to container with Linux user namespace and only uid mappings",
+			canIDMapMounts: true,
 			spec: &oci.Spec{
 				Linux: &oci.Linux{
 					UIDMappings: []oci.LinuxIDMapping{
@@ -1314,7 +1319,8 @@ func TestApplyContainerEdits(t *testing.T) {
 			},
 		},
 		{
-			name: "mount added to container with Linux user namespace without uid/gid mappings",
+			name:           "mount added to container with Linux user namespace without uid/gid mappings",
+			canIDMapMounts: true,
 			spec: &oci.Spec{
 				Linux: &oci.Linux{
 					Namespaces: []oci.LinuxNamespace{
@@ -1358,8 +1364,131 @@ func TestApplyContainerEdits(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:           "mount not idmapped if the host can't set up idmapped mounts",
+			canIDMapMounts: false,
+			spec: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+			},
+			edits: &cdi.ContainerEdits{
+				Mounts: []*cdi.Mount{
+					{
+						HostPath:      "/some/host/path1",
+						ContainerPath: "/dest/path/a",
+						Type:          "bind",
+					},
+					{
+						HostPath:      "/some/host/path2",
+						ContainerPath: "/dest/path/b",
+						Type:          "bind",
+						Options:       []string{"rbind"},
+					},
+				},
+			},
+			result: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/a",
+						Type:        "bind",
+					},
+					{
+						Source:      "/some/host/path2",
+						Destination: "/dest/path/b",
+						Type:        "bind",
+						Options:     []string{"rbind"},
+					},
+				},
+			},
+		},
+		{
+			name:           "explicitly requested idmap option kept if the host can't set up idmapped mounts",
+			canIDMapMounts: false,
+			spec: &oci.Spec{
+				Linux: &oci.Linux{
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+						},
+					},
+				},
+			},
+			edits: &cdi.ContainerEdits{
+				Mounts: []*cdi.Mount{
+					{
+						HostPath:      "/some/host/path1",
+						ContainerPath: "/dest/path/a",
+						Type:          "bind",
+						Options:       []string{"bind", "idmap"},
+					},
+				},
+			},
+			result: &oci.Spec{
+				Linux: &oci.Linux{
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/a",
+						Type:        "bind",
+						Options:     []string{"bind", "idmap"},
+					},
+				},
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			restore := fakeIDMapMountsAvailable(tc.canIDMapMounts)
+			defer restore()
+
 			edits := ContainerEdits{tc.edits}
 			err := edits.Validate()
 			require.NoError(t, err)
@@ -1368,6 +1497,14 @@ func TestApplyContainerEdits(t *testing.T) {
 			require.Equal(t, tc.result, tc.spec)
 		})
 	}
+}
+
+// fakeIDMapMountsAvailable overrides host idmapped mount detection and
+// returns a function to restore the original one.
+func fakeIDMapMountsAvailable(available bool) func() {
+	saved := idMapMountsAvailable
+	idMapMountsAvailable = func() bool { return available }
+	return func() { idMapMountsAvailable = saved }
 }
 
 func TestAppend(t *testing.T) {
