@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"tags.cncf.io/container-device-interface/internal/ociedit"
@@ -70,9 +71,29 @@ type ContainerEdits struct {
 	*cdi.ContainerEdits
 }
 
-// Apply edits to the given OCI Spec. Updates the OCI Spec in place.
-// Returns an error if the update fails.
-func (e *ContainerEdits) Apply(spec *oci.Spec) error {
+// ApplyOptions contain extra options for applying ContainerEdits to a
+// an OCI Spec.
+type ApplyOptions struct {
+	idMapForBindMount bool
+}
+
+// ApplyOption is an option for applying ContainerEdits.
+type ApplyOption func(*ApplyOptions)
+
+// WithIDMappingForBindMount enables or disables the injection of UID/GID
+// mapping mount options for bind mounts. By default options are injected
+// if the OCI Spec has a Linux UserNamespace with both UID and GID mappings,
+// and the environment supports idmapped mounts. This option overrides that
+// default.
+func WithIDMappingForBindMount(v bool) ApplyOption {
+	return func(o *ApplyOptions) {
+		o.idMapForBindMount = v
+	}
+}
+
+// Apply edits to the given OCI Spec and optional options. Updates the OCI
+// Spec in place. Returns an error if the update fails.
+func (e *ContainerEdits) Apply(spec *oci.Spec, opts ...ApplyOption) error {
 	if spec == nil {
 		return errors.New("can't edit nil OCI Spec")
 	}
@@ -81,6 +102,13 @@ func (e *ContainerEdits) Apply(spec *oci.Spec) error {
 	}
 	if err := e.Validate(); err != nil {
 		return err
+	}
+
+	options := &ApplyOptions{
+		idMapForBindMount: idMapMountsAvailable(),
+	}
+	for _, opt := range opts {
+		opt(options)
 	}
 
 	editor, err := ociedit.NewSpecEditor(spec)
@@ -146,10 +174,10 @@ func (e *ContainerEdits) Apply(spec *oci.Spec) error {
 
 			editor.RemoveMount(m.ContainerPath)
 
-			if !specHasIDMappingNamespace(spec) {
-				editor.AddMount(mnt.toOCI())
-			} else {
+			if specHasIDMappingNamespace(spec) && options.idMapForBindMount {
 				editor.AddMount(mnt.toOCI(withIDMapForBindMount()))
+			} else {
+				editor.AddMount(mnt.toOCI())
 			}
 		}
 		sortMounts(editor)
@@ -563,6 +591,11 @@ func (m orderedMounts) Swap(i, j int) {
 func (m orderedMounts) parts(i int) int {
 	return strings.Count(filepath.Clean(m[i].Destination), string(os.PathSeparator))
 }
+
+// idMapMountsAvailable returns true if idmapped mounts can be set up in this
+// environment. We assume it can't change during the lifetime of the process.
+// It is a function so we can fake it in unit tests.
+var idMapMountsAvailable = sync.OnceValue(canIDMapMounts)
 
 // specHasIDMappingNamespace returns true if the OCI Spec has a Linux UserNamespace
 // together with both UID and GID mappings. A user namespace lacking either

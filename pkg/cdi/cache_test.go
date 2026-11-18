@@ -827,13 +827,15 @@ func TestInjectDevice(t *testing.T) {
 		run map[string]string
 	}
 	type testCase struct {
-		name        string
-		cdiSpecs    specDirs
-		ociSpec     *oci.Spec
-		devices     []string
-		result      *oci.Spec
-		unresolved  []string
-		expectedErr error
+		name           string
+		canIDMapMounts bool
+		options        []Option
+		cdiSpecs       specDirs
+		ociSpec        *oci.Spec
+		devices        []string
+		result         *oci.Spec
+		unresolved     []string
+		expectedErr    error
 	}
 	for _, tc := range []*testCase{
 		{
@@ -1167,6 +1169,328 @@ devices:
 			},
 			expectedErr: errors.New("unresolvable CDI devices vendor1.com/device=dev2"),
 		},
+		{
+			name:           "ID mappings on by default, if supported",
+			canIDMapMounts: true,
+			cdiSpecs: specDirs{
+				etc: map[string]string{
+					"vendor1.yaml": `
+cdiVersion: "1.0.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      mounts:
+      - hostPath: "/some/host/path3"
+        containerPath: "/dest/path/a"
+        type: "bind"
+      - hostPath: "/some/host/path4"
+        containerPath: "/dest/path/d"
+        type: "bind"
+        options:
+        - "rbind"
+`,
+				},
+			},
+			ociSpec: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/c",
+					},
+					{
+						Source:      "/some/host/path2",
+						Destination: "/dest/path/b",
+					},
+				},
+			},
+			devices: []string{
+				"vendor1.com/device=dev1",
+			},
+			result: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/c",
+					},
+					{
+						Source:      "/some/host/path2",
+						Destination: "/dest/path/b",
+					},
+					{
+						Source:      "/some/host/path3",
+						Destination: "/dest/path/a",
+						Type:        "bind",
+						Options:     []string{"idmap"},
+					},
+					{
+						Source:      "/some/host/path4",
+						Destination: "/dest/path/d",
+						Type:        "bind",
+						Options:     []string{"rbind", "ridmap"},
+					},
+				},
+			},
+		},
+		{
+			name:           "ID mappings off by default, if unsupported",
+			canIDMapMounts: false,
+			cdiSpecs: specDirs{
+				etc: map[string]string{
+					"vendor1.yaml": `
+cdiVersion: "1.0.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      mounts:
+      - hostPath: "/some/host/path3"
+        containerPath: "/dest/path/a"
+        type: "bind"
+      - hostPath: "/some/host/path4"
+        containerPath: "/dest/path/d"
+        type: "bind"
+        options:
+        - "rbind"
+`,
+				},
+			},
+			ociSpec: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/c",
+					},
+					{
+						Source:      "/some/host/path2",
+						Destination: "/dest/path/b",
+					},
+				},
+			},
+			devices: []string{
+				"vendor1.com/device=dev1",
+			},
+			result: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/c",
+					},
+					{
+						Source:      "/some/host/path2",
+						Destination: "/dest/path/b",
+					},
+					{
+						Source:      "/some/host/path3",
+						Destination: "/dest/path/a",
+						Type:        "bind",
+					},
+					{
+						Source:      "/some/host/path4",
+						Destination: "/dest/path/d",
+						Type:        "bind",
+						Options:     []string{"rbind"},
+					},
+				},
+			},
+		},
+		{
+			name:           "ID mappings can be forced off by an option",
+			canIDMapMounts: true,
+			options: []Option{
+				WithIDMapping(false),
+			},
+			cdiSpecs: specDirs{
+				etc: map[string]string{
+					"vendor1.yaml": `
+cdiVersion: "1.0.0"
+kind:       "vendor1.com/device"
+devices:
+  - name: "dev1"
+    containerEdits:
+      mounts:
+      - hostPath: "/some/host/path3"
+        containerPath: "/dest/path/a"
+        type: "bind"
+      - hostPath: "/some/host/path4"
+        containerPath: "/dest/path/d"
+        type: "bind"
+        options:
+        - "rbind"
+`,
+				},
+			},
+			ociSpec: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/c",
+					},
+					{
+						Source:      "/some/host/path2",
+						Destination: "/dest/path/b",
+					},
+				},
+			},
+			devices: []string{
+				"vendor1.com/device=dev1",
+			},
+			result: &oci.Spec{
+				Linux: &oci.Linux{
+					UIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      1000,
+							Size:        999,
+						},
+					},
+					GIDMappings: []oci.LinuxIDMapping{
+						{
+							ContainerID: 0,
+							HostID:      2000,
+							Size:        777,
+						},
+					},
+					Namespaces: []oci.LinuxNamespace{
+						{
+							Type: oci.UserNamespace,
+							Path: "/foo/bar",
+						},
+					},
+				},
+				Mounts: []oci.Mount{
+					{
+						Source:      "/some/host/path1",
+						Destination: "/dest/path/c",
+					},
+					{
+						Source:      "/some/host/path2",
+						Destination: "/dest/path/b",
+					},
+					{
+						Source:      "/some/host/path3",
+						Destination: "/dest/path/a",
+						Type:        "bind",
+					},
+					{
+						Source:      "/some/host/path4",
+						Destination: "/dest/path/d",
+						Type:        "bind",
+						Options:     []string{"rbind"},
+					},
+				},
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
@@ -1174,18 +1498,26 @@ devices:
 				err   error
 				cache *Cache
 			)
+
+			restore := fakeIDMapMountsAvailable(tc.canIDMapMounts)
+			defer restore()
+
 			dir, err = createSpecDirs(t, tc.cdiSpecs.etc, tc.cdiSpecs.run)
 			if err != nil {
 				t.Errorf("failed to create test directory: %v", err)
 				return
 			}
 			cache = newCache(
-				WithSpecDirs(
-					filepath.Join(dir, "etc"),
-					filepath.Join(dir, "run"),
-				),
+				append(
+					tc.options,
+					WithSpecDirs(
+						filepath.Join(dir, "etc"),
+						filepath.Join(dir, "run"),
+					),
+				)...,
 			)
 			require.NotNil(t, cache)
+			require.Equal(t, 0, len(cache.GetErrors()), "unexpected errors in cache: %v", cache.GetErrors())
 
 			unresolved, err := cache.InjectDevices(tc.ociSpec, tc.devices...)
 			if len(tc.unresolved) != 0 {

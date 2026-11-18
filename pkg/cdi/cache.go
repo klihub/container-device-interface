@@ -45,6 +45,7 @@ type Cache struct {
 	dirErrors map[string]error
 
 	autoRefresh bool
+	idMapping   *bool
 	watch       *watch
 }
 
@@ -70,6 +71,21 @@ func (c *Cache) Unlock() {
 func WithAutoRefresh(autoRefresh bool) Option {
 	return func(c *Cache) {
 		c.autoRefresh = autoRefresh
+	}
+}
+
+// WithIDMapping controls whether automatic injection of UID/GID mapping
+// is attempted. Currently this only has an effect when injecting bind
+// mounts into a container.
+
+// WithIDMapping controls attempts to automatically handle UID/GID mapping
+// during CDI device injection. Currently it only controls the injection of
+// mount options for bind mounts. By default options are injected if the OCI
+// Spec has a Linux UserNamespace with both UID and GID mappings, and the
+// environment supports idmapped mounts. This option overrides that default.
+func WithIDMapping(v bool) Option {
+	return func(c *Cache) {
+		c.idMapping = &v
 	}
 }
 
@@ -267,7 +283,12 @@ func (c *Cache) InjectDevices(ociSpec *oci.Spec, devices ...string) ([]string, e
 			strings.Join(unresolved, ", "))
 	}
 
-	if err := edits.Apply(ociSpec); err != nil {
+	var applyOptions []ApplyOption
+	if c.idMapping != nil {
+		applyOptions = append(applyOptions, WithIDMappingForBindMount(*c.idMapping))
+	}
+
+	if err := edits.Apply(ociSpec, applyOptions...); err != nil {
 		return nil, fmt.Errorf("failed to inject devices: %w", err)
 	}
 
